@@ -2,7 +2,9 @@
 
 Dynamaik is a PyTorch project for predicting product SMILES and molecular formulas from GC-MS spectra, optionally conditioned on reaction reactants and sum formulas. The current training pipeline supports spectrum encoders, reactant encoders, formula encoders/decoders, fusion encoders, multitask SMILES/formula prediction, and validation-time confidence reporting for SMARTS-defined substructures.
 
-![DynaMAIK.png](img/DynaMAIK_toc.png)
+<p align="center">
+  <img src="img/DynaMAIK_toc.png" width="700">
+</p>
 
 ## Project Structure
 
