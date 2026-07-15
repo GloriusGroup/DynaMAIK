@@ -1,4 +1,4 @@
-# Dynamaik
+# DynaMAIK
 
 Dynamaik is a PyTorch project for predicting product SMILES and molecular formulas from GC-MS spectra, optionally conditioned on reaction reactants and sum formulas. The current training pipeline supports spectrum encoders, reactant encoders, formula encoders/decoders, fusion encoders, multitask SMILES/formula prediction, and validation-time confidence reporting for SMARTS-defined substructures.
 
@@ -10,8 +10,8 @@ src/
     collate.py          Batch collation and teacher-forcing tensor creation
     loaders.py          Dataset class for spectra, reaction SMILES, products, and formulas
     preprocess.py       Spectrum vectorization, peak extraction, SMILES enumeration helpers
+    smarts_filtered.txt SMARTS list for functional group confidence
     tokenizers.py       SMILES and formula tokenizers
-    validators.py       Optional dataframe validation helper
 
   models/
     configs.py          TrainConfig and TransformerConfig dataclasses
@@ -20,7 +20,6 @@ src/
     predict.py          Inference CLI for trained checkpoints
     spec2prod.py        Main spectrum/reactant/formula encoder-decoder components
     train.py            Training entry point
-    transformer.py      Standalone reference transformer/demo module
 
   utils/
     model_runtime.py    Shared runtime helpers for memory construction and metrics
@@ -45,17 +44,16 @@ src/
 
 The project expects a Python environment with the scientific/ML chemistry stack used in the source code:
 
-- Python 3.10+
-- PyTorch
-- pandas
-- numpy
-- scikit-learn
-- tqdm
-- mlflow
-- RDKit
-- PyYAML, if using `src/models/transformer.py`
-
-No dependency lockfile is currently included in the repository. Create one before publication if exact reproducibility is required.
+Python 3.10+
+torch==2.9.0
+pandas==2.3.3
+numpy==2.2.6
+scikit-learn==1.7.2
+tqdm==4.67.1
+mlflow==3.6.0
+rdkit==2025.9.1
+PyYAML==6.0.3
+pyarrow==22.0.0
 
 ## Data Format
 
