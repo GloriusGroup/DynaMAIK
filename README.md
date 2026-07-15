@@ -1,103 +1,166 @@
 # DynaMAIK
 
-Dynamaik is a PyTorch project for predicting product SMILES and molecular formulas from GC-MS spectra, optionally conditioned on reaction reactants and sum formulas. The current training pipeline supports spectrum encoders, reactant encoders, formula encoders/decoders, fusion encoders, multitask SMILES/formula prediction, and validation-time confidence reporting for SMARTS-defined substructures.
+DynaMAIK is a PyTorch project for predicting product SMILES and molecular formulas from GC-MS spectra. Models can optionally use reaction reactants or a known molecular formula as additional inputs and can jointly predict product SMILES and molecular formulas.
 
 <p align="center">
   <img src="img/DynaMAIK_toc.png" width="500">
 </p>
+
+## Features
+
+- Raw, ordered-bin, and top-k peak spectrum encoders.
+- Product-only and full reaction-sequence decoding.
+- Optional reactant and molecular-formula encoders.
+- Optional joint SMILES and molecular-formula decoding.
+- Attention-based fusion or multi-source decoder attention.
+- Optional element-count auxiliary loss.
+- Greedy or top-k autoregressive generation.
+- Validation-time molecular and SMARTS-based confidence metrics.
+- CSV and Parquet input support.
+- MLflow experiment tracking and checkpoint artifacts.
+
+## Requirements
+
+- Python 3.10 or newer.
+- The dependencies pinned in `requirements.txt`.
+- CUDA is optional. Training and prediction can run on CPU, although model training will be substantially slower.
+
+Create an environment and install the dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+RDKit and PyTorch installation requirements can vary by platform. If installation through `pip` is not suitable for your system, use an equivalent Conda environment with the versions listed in `requirements.txt`.
 
 ## Project Structure
 
 ```text
 src/
   data/
-    collate.py          Batch collation and teacher-forcing tensor creation
-    loaders.py          Dataset class for spectra, reaction SMILES, products, and formulas
-    preprocess.py       Spectrum vectorization, peak extraction, SMILES enumeration helpers
-    smarts_filtered.txt SMARTS list for functional group confidence
-    tokenizers.py       SMILES and formula tokenizers
-
+    collate.py          Batch collation and teacher-forcing tensors
+    loaders.py          Dataset, table I/O, and spectrum validation
+    preprocess.py       Spectrum and SMILES preprocessing
+    tokenizers.py       SMILES and molecular-formula tokenizers
+    smarts_filtered.txt SMARTS definitions used for confidence metrics
   models/
-    configs.py          TrainConfig and TransformerConfig dataclasses
-    evaluation.py       Validation metrics and generation-based evaluation
-    metrics.py          Token/sequence metrics, Tanimoto, substructure stats
-    predict.py          Inference CLI for trained checkpoints
-    spec2prod.py        Main spectrum/reactant/formula encoder-decoder components
-    train.py            Training entry point
-
+    configs.py          Training and model configuration
+    evaluation.py       Validation and generation metrics
+    metrics.py          Molecular and token-level metrics
+    predict.py          Checkpoint-based prediction CLI
+    spec2prod.py        Encoder, decoder, and fusion modules
+    train.py            Training entry point and checkpoint handling
   utils/
-    model_runtime.py    Shared runtime helpers for memory construction and metrics
-    train_runtime.py    Training orchestration helpers
-    utils_train.py      Logging, scheduler, chemistry, SMARTS, and formula-count helpers
+    model_runtime.py    Shared encoder-memory and metric helpers
+    train_runtime.py    Configuration, model, and training dispatch
+    utils_train.py      Scheduling, chemistry, logging, and prefix helpers
+tests/
+  test_core.py          Regression and supported-mode smoke tests
 ```
 
-## Main Capabilities
+## Input Data
 
-- Spectrum encoding from raw vectors, ordered bins, or top-k 2D peak tensors.
-- Product-only or full reaction-sequence decoding.
-- Optional reactant encoder.
-- Optional formula encoder.
-- Optional formula decoder for multitask SMILES plus formula prediction.
-- Optional fusion encoder for spectrum/reactant memory fusion.
-- Optional count head for element-count auxiliary loss.
-- Autoregressive validation prediction logging.
-- SMARTS-based substructure confidence reporting.
-- Checkpoint-based batch prediction from CSV or Parquet inputs.
+Training and prediction accept tabular molecular data. Default column names are defined by `TrainConfig` in `src/models/configs.py`.
 
-## Requirements
+| Column | Default name | Description |
+| --- | --- | --- |
+| Spectrum | `SPECTRUM_PREDICTED` | Dictionary mapping integer m/z values to numeric intensities |
+| Reaction SMILES | `reaction_smiles` | Usually `REACTANTS>>PRODUCT` |
+| Molecular formula | `sum_formula` | Product formula such as `C6H12O6` |
 
-The project expects a Python environment with the scientific/ML chemistry stack used in the source code:
+CSV spectrum values are Python-literal dictionary strings:
 
-Python 3.10+
-torch==2.9.0
-pandas==2.3.3
-numpy==2.2.6
-scikit-learn==1.7.2
-tqdm==4.67.1
-mlflow==3.6.0
-rdkit==2025.9.1
-PyYAML==6.0.3
-pyarrow==22.0.0
+```text
+"{43: 0.5, 91: 1.0}"
+```
 
-## Data Format
+Parquet files may store the same value as a native dictionary. Spectrum m/z keys must be integer-valued, and intensities must be finite numbers.
 
-Training and prediction use tabular CSV/Parquet data. The default column names are defined in `src/models/configs.py`:
+The formula column is required during training when either `formula_encoder` or `formula_decoder` is enabled. During prediction it is required only when `formula_encoder` is enabled.
 
-- `SPECTRUM_PREDICTED`: spectrum dictionary stored as a Python-literal string, for example `{43: 0.5, 91: 1.0}`.
-- `reaction_smiles`: reaction SMILES, usually `REACTANTS>>PRODUCT`.
-- `sum_formula`: product molecular formula, required when formula encoder/decoder paths are enabled.
+## Configuration
 
-Important configuration fields in `TrainConfig`:
+Training is configured through `TrainConfig` in `src/models/configs.py`. Update at least these path fields before starting a run:
 
-- `dataset`: training dataset filename.
-- `validation_path`: optional external validation CSV path.
-- `home_path`: base path used by the current training script.
-- `spectrum_column`, `reaction_smiles_column`, `formula_column`: dataframe column names.
-- `encoder_mode`: one of `raw`, `binned`, or `binned_2D`.
-- `decoder_mode`: `product` or `rxn`.
+- `home_path`: base directory used for data and MLflow artifacts.
+- `dataset`: training CSV or Parquet filename.
+- `validation_path`: optional validation CSV; use `None` for an automatic train/validation split.
 
-The current defaults contain local absolute paths. Update `TrainConfig` before running in a new environment.
+Important model options include:
+
+| Option | Description |
+| --- | --- |
+| `encoder_mode` | `raw`, `binned`, or `binned_2D` |
+| `decoder_mode` | `product` or `rxn` |
+| `spectrum_encoder` | Use spectra as model input |
+| `reactant_encoder` | Encode reactants separately in product mode |
+| `formula_encoder` | Use a known formula as model input |
+| `formula_decoder` | Jointly predict the molecular formula |
+| `train_formula_only` | Train only the formula decoder |
+| `fusion_encoder` | Fuse spectrum and reactant memories before decoding |
+| `multi_source_decoder` | Attend to spectrum and reactant memories separately |
+| `use_count_head` | Add an element-count auxiliary objective |
+| `frags` | Select one reactant fragment while preserving the product |
+| `enum_smiles` | Apply randomized RDKit SMILES enumeration |
+
+Invalid combinations are rejected before data loading. In particular:
+
+- `formula_encoder` and `formula_decoder` are mutually exclusive.
+- Formula-only training requires `formula_decoder=True` and currently does not support a reactant encoder.
+- Fusion and multi-source decoding both require spectrum and reactant encoders and cannot be enabled together.
+- Multi-source decoding does not currently support formula-encoder memory.
+- `decoder_mode="rxn"` currently supports spectrum input only.
+- Recursive model options require `src.models.tiny_recursive`, which is not included in this repository.
 
 ## Training
 
-Edit `src/models/configs.py` to set dataset paths and model/training options, then run:
+After configuring `TrainConfig`, start training from the repository root:
 
 ```bash
 python -m src.models.train
 ```
 
-Training uses MLflow for run tracking and writes artifacts under the active MLflow artifact directory, including:
+Training performs the following steps:
 
-- `smiles_tokenizer.json`
-- `formula_tokenizer.json`, when formula modeling is enabled
-- `checkpoints/best.pt`
-- `checkpoints/epoch_XXX.pt`
-- `predictions/*.csv`
-- final model component weights in `predictions/`
+1. Loads and validates the configured data.
+2. Fits and freezes the SMILES and optional formula tokenizers.
+3. Builds the configured encoders and decoders.
+4. Tracks losses, metrics, and learning rates through MLflow.
+5. Writes best and per-epoch checkpoints.
+6. Writes validation predictions and final component weights.
+
+The default configuration contains machine-specific dataset and MLflow paths. It will not be portable until `home_path`, `dataset`, and `validation_path` are updated for the local environment.
+
+## Artifacts
+
+Artifacts are written below the active MLflow artifact directory:
+
+```text
+artifacts/
+  smiles_tokenizer.json
+  formula_tokenizer.json          # when formula modeling is enabled
+  checkpoints/
+    best.pt
+    epoch_XXX.pt
+  predictions/
+    encoder.pt
+    decoder.pt
+    reactant_encoder.pt           # when enabled
+    formula_encoder.pt            # when enabled
+    formula_decoder.pt            # when enabled
+    fusion_encoder.pt             # when enabled
+    count_head.pt                 # when enabled
+    val_generated_epoch_XXX.csv
+```
+
+Checkpoints contain all enabled model components, optimizer state, epoch, and training configuration. Prediction prefers component states stored in the checkpoint and supports standalone component files as a fallback for older artifacts.
 
 ## Prediction
 
-Run inference with a trained checkpoint:
+Run prediction with a training checkpoint and an input CSV or Parquet file:
 
 ```bash
 python -m src.models.predict \
@@ -106,11 +169,13 @@ python -m src.models.predict \
   --ckpt /path/to/artifacts/checkpoints/best.pt
 ```
 
-Common options:
+If `--artifact_dir` is omitted, the predictor assumes the checkpoint is located in `<artifact_dir>/checkpoints/` and loads tokenizers from the inferred artifact directory.
+
+Useful options:
 
 ```bash
 python -m src.models.predict \
-  --input data.csv \
+  --input data.parquet \
   --out predictions.csv \
   --ckpt mlruns/.../artifacts/checkpoints/best.pt \
   --artifact_dir mlruns/.../artifacts \
@@ -118,52 +183,37 @@ python -m src.models.predict \
   --reaction_smiles_col reaction_smiles \
   --formula_col sum_formula \
   --batch_size 64 \
-  --device cuda \
+  --device cpu \
   --temperature 1.0 \
   --topk 50 \
   --num_samples 10 \
   --rerank_by_frequency
 ```
 
-The predictor loads tokenizer artifacts from `artifact_dir`. If `artifact_dir` is omitted, it assumes the checkpoint is inside `artifact_dir/checkpoints/`.
+Prediction uses CPU automatically when the checkpoint requests CUDA but CUDA is unavailable. An explicitly requested unavailable CUDA device produces an error instead of silently changing devices.
 
-## Configuration Notes
-
-Most behavior is controlled by `TrainConfig` in `src/models/configs.py`.
-
-High-impact options:
-
-- `reactant_encoder`: include reactants as an input source.
-- `spectrum_encoder`: include spectra as an input source.
-- `formula_encoder`: encode formula as model input.
-- `formula_decoder`: add formula prediction as a decoder task.
-- `train_formula_only`: train only formula prediction.
-- `fusion_encoder`: fuse spectrum and reactant representations.
-- `multi_source_decoder`: use separate decoder attention over spectrum and reactant memory.
-- `topk`, `k_samples`, `temperature`: generation behavior.
-- `confidence`, `smarts_path`: SMARTS confidence reporting.
-
-## Development Notes
-
-- `src/utils/model_runtime.py` contains shared runtime helpers used by training and evaluation.
-- `src/utils/train_runtime.py` contains training-specific orchestration helpers.
-- `src/models/spec2prod.py` contains the main model definitions used by training and prediction.
-- Recursive model components require `src.models.tiny_recursive`, which is not currently included. Non-recursive paths import and run without it.
+For reaction-sequence models, provide reaction prefixes such as `CC.O>>` in the reaction SMILES column. Generation starts from the supplied reactants and reaction separator.
 
 ## Verification
 
-Basic repository checks used during refactoring:
+Run the regression and supported-configuration smoke tests:
 
 ```bash
-python -m compileall src
-python -c "import src.models.train; print('train ok')"
-python -c "import src.models.evaluation; print('evaluation ok')"
-python -c "import src.utils.model_runtime, src.utils.train_runtime; print('utils ok')"
+python -m unittest discover -s tests -v
 ```
 
-## Known Cleanup Candidates
+Run syntax and import checks:
 
-- Replace absolute paths in `TrainConfig` with CLI/config-file arguments.
-- Add a dependency file such as `requirements.txt`, `environment.yml`, or `pyproject.toml`.
-- Remove empty placeholder files and generated `__pycache__` directories before publication.
-- Decide whether standalone/demo modules such as `src/models/transformer.py` should remain in the published package.
+```bash
+python -m compileall src tests
+python -c "import src.models.train, src.models.predict, src.models.evaluation"
+```
+
+The tests cover tokenizer round trips and truncation, spectrum boundaries, fragment augmentation, configuration validation, padding masks, checkpoint contents, and optimization steps for representative supported model configurations.
+
+## Current Limitations
+
+- Training paths are configured in Python rather than through a dedicated CLI or configuration file.
+- External validation data is currently loaded from CSV.
+- Recursive encoder and decoder options depend on modules not included in this repository.
+- Full model quality and throughput depend on the training dataset and hardware and are not covered by the unit tests.
