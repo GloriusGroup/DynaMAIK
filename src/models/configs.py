@@ -1,6 +1,10 @@
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+
+
+DEFAULT_SMARTS_PATH = str(Path(__file__).resolve().parents[1] / "data" / "smarts_filtered.txt")
 
 
 @dataclass
@@ -50,7 +54,7 @@ class TrainConfig:
     count_elements: tuple[str] = ("C", "H", "B", "Br", "Cl", "F", "I", "N", "O", "P", "S", "Si")
 
     # Paths
-    smarts_path: str = "/home/student/maik/projects/next_in_nrw/reaction_dev/src/data/smarts_filtered.txt"
+    smarts_path: str = DEFAULT_SMARTS_PATH
     home_path: str = "/home/student/maik/projects/next_in_nrw"
     validation_path: str | None = '/home/student/maik/projects/next_in_nrw/reaction_dev/data_science/cleaned/final_with_spectra/real_virtual_with_reagents_with_formula_test_2_frags_no_Hs.csv'  # if None, use 10% of training data as validation set
 
@@ -130,6 +134,5 @@ class TrainConfig:
     enc_react_lr_min: float = 1e-6
     enc_formula_lr_min: float = 1e-6
     dec_lr_min: float = 1e-6
-
 
 

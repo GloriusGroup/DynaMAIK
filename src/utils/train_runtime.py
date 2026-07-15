@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import partial
+
 import mlflow
 import torch
 
@@ -46,6 +48,44 @@ def require_recursive_network():
     return TRMAttentionNetwork
 
 
+def validate_config(cfg: TrainConfig) -> None:
+    """Reject unsupported model/data combinations before loading any data."""
+    if cfg.encoder_mode not in {"raw", "binned", "binned_2D"}:
+        raise ValueError(f"Unsupported encoder_mode: {cfg.encoder_mode}")
+    if cfg.decoder_mode not in {"product", "rxn"}:
+        raise ValueError(f"Unsupported decoder_mode: {cfg.decoder_mode}")
+    if cfg.max_smiles_len < 3 or cfg.formula_max_len < 3:
+        raise ValueError("max_smiles_len and formula_max_len must be at least 3")
+    if cfg.cnn and (cfg.k_size < 1 or cfg.k_size % 2 == 0):
+        raise ValueError("k_size must be a positive odd number when cnn=True")
+    if not (cfg.spectrum_encoder or cfg.reactant_encoder or cfg.formula_encoder):
+        raise ValueError("Enable at least one spectrum, reactant, or formula encoder")
+    if cfg.formula_encoder and cfg.formula_decoder:
+        raise ValueError("formula_encoder and formula_decoder cannot both be enabled")
+    if cfg.train_formula_only and not cfg.formula_decoder:
+        raise ValueError("train_formula_only=True requires formula_decoder=True")
+    if cfg.train_formula_only and cfg.reactant_encoder:
+        raise ValueError("Formula-only training with a reactant encoder is not implemented")
+    if cfg.fusion_encoder and not (cfg.spectrum_encoder and cfg.reactant_encoder):
+        raise ValueError("fusion_encoder requires spectrum_encoder and reactant_encoder")
+    if cfg.multi_source_decoder and not (cfg.spectrum_encoder and cfg.reactant_encoder):
+        raise ValueError("multi_source_decoder requires spectrum_encoder and reactant_encoder")
+    if cfg.fusion_encoder and cfg.multi_source_decoder:
+        raise ValueError("fusion_encoder and multi_source_decoder are alternative fusion strategies")
+    if cfg.formula_encoder and cfg.multi_source_decoder:
+        raise ValueError("multi_source_decoder does not support formula encoder memory")
+    if cfg.recursive_decoder and cfg.multi_source_decoder:
+        raise ValueError("recursive_decoder does not support multi-source memory")
+    if cfg.recursive_spectrum_encoder and cfg.encoder_mode != "raw":
+        raise ValueError("recursive_spectrum_encoder requires encoder_mode='raw'")
+    if cfg.decoder_mode == "rxn" and any(
+        (cfg.reactant_encoder, cfg.formula_encoder, cfg.formula_decoder)
+    ):
+        raise ValueError(
+            "decoder_mode='rxn' currently supports spectrum input only; disable reactant and formula encoders/decoders"
+        )
+
+
 def unpack_training_batch(batch, cfg, device, reactant_enc=None, formula_enc=None, formula_dec=None):
     """Normalize all supported training batch layouts into named tensors."""
     data = {
@@ -60,23 +100,27 @@ def unpack_training_batch(batch, cfg, device, reactant_enc=None, formula_enc=Non
         "smi_out": None,
     }
 
-    if reactant_enc is not None and formula_dec is not None:
-        spec_batch, data["reactant_ids"], data["fml_in"], data["fml_out"], data["formula_strs"], data["smi_in"], data["smi_out"] = batch
-        data["tgt_out"] = data["smi_out"]
-    elif formula_dec is not None and cfg.train_formula_only and reactant_enc is None:
-        spec_batch, data["fml_in"], data["fml_out"], data["formula_strs"] = batch
-        data["tgt_out"] = data["fml_out"]
-    elif formula_dec is not None and reactant_enc is None:
-        spec_batch, data["fml_in"], data["fml_out"], data["formula_strs"], data["smi_in"], data["smi_out"] = batch
-        data["tgt_out"] = data["smi_out"]
-    elif reactant_enc is not None and formula_enc is not None:
-        spec_batch, data["reactant_ids"], data["formula_ids"], data["formula_strs"], data["tgt_in"], data["tgt_out"] = batch
-    elif reactant_enc is not None:
-        spec_batch, data["reactant_ids"], data["tgt_in"], data["tgt_out"] = batch
-    elif formula_enc is not None:
-        spec_batch, data["formula_ids"], data["formula_strs"], data["tgt_in"], data["tgt_out"] = batch
-    else:
-        spec_batch, data["tgt_in"], data["tgt_out"] = batch
+    mode = (reactant_enc is not None, formula_enc is not None, formula_dec is not None, bool(cfg.train_formula_only))
+    match mode:
+        case (True, False, True, False):
+            spec_batch, data["reactant_ids"], data["fml_in"], data["fml_out"], data["formula_strs"], data["smi_in"], data["smi_out"] = batch
+            data["tgt_out"] = data["smi_out"]
+        case (False, False, True, True):
+            spec_batch, data["fml_in"], data["fml_out"], data["formula_strs"] = batch
+            data["tgt_out"] = data["fml_out"]
+        case (False, False, True, False):
+            spec_batch, data["fml_in"], data["fml_out"], data["formula_strs"], data["smi_in"], data["smi_out"] = batch
+            data["tgt_out"] = data["smi_out"]
+        case (True, True, False, False):
+            spec_batch, data["reactant_ids"], data["formula_ids"], data["formula_strs"], data["tgt_in"], data["tgt_out"] = batch
+        case (True, False, False, False):
+            spec_batch, data["reactant_ids"], data["tgt_in"], data["tgt_out"] = batch
+        case (False, True, False, False):
+            spec_batch, data["formula_ids"], data["formula_strs"], data["tgt_in"], data["tgt_out"] = batch
+        case (False, False, False, False):
+            spec_batch, data["tgt_in"], data["tgt_out"] = batch
+        case _:
+            raise ValueError(f"Unsupported training batch configuration: {mode}")
 
     data["spec_batch"] = spec_batch.to(device, non_blocking=True)
     for key in ("reactant_ids", "formula_ids", "tgt_in", "tgt_out", "fml_in", "fml_out", "smi_in", "smi_out"):
@@ -112,7 +156,7 @@ def count_head_loss(cfg, count_head, formula_tokenizer, formula_dec, hidden_fml,
         pad_id=formula_dec.pad_id,
         eos_id=formula_tokenizer.eos_id,
     ).to(pred_counts.device)
-    return torch.nn.functional.smooth_l1_loss(torch.relu(pred_counts), true_counts)
+    return torch.nn.functional.smooth_l1_loss(torch.nn.functional.softplus(pred_counts), true_counts)
 
 
 def epoch_lrs(cfg: TrainConfig, epoch: int) -> dict[str, float]:
@@ -246,50 +290,63 @@ def print_epoch_summary(epoch, cfg, train_loss, val_metrics, lrs, dt, formula_de
 
 
 def select_collate_fn(cfg: TrainConfig, pad_id: int):
-    if cfg.decoder_mode != "product":
-        return lambda batch: collate_batch(batch, pad_id)
-    if cfg.train_formula_only and cfg.formula_decoder and not cfg.reactant_encoder:
-        return lambda batch: collate_batch_formula_only(batch, pad_id)
-    if cfg.reactant_encoder and cfg.formula_decoder:
-        return lambda batch: collate_batch_product_only_with_reactants_and_formula_multitask(batch, pad_id)
-    if (not cfg.reactant_encoder) and cfg.formula_decoder:
-        return lambda batch: collate_batch_product_only_with_formula_multitask(batch, pad_id)
-    if cfg.reactant_encoder and cfg.formula_encoder:
-        return lambda batch: collate_batch_product_only_with_reactants_and_formula(batch, pad_id)
-    if cfg.reactant_encoder:
-        return lambda batch: collate_batch_product_only_with_reactants(batch, pad_id)
-    if cfg.formula_encoder:
-        return lambda batch: collate_batch_product_only_with_formula(batch, pad_id)
-    return lambda batch: collate_batch_product_only(batch, pad_id)
+    mode = (
+        cfg.decoder_mode,
+        cfg.train_formula_only,
+        cfg.reactant_encoder,
+        cfg.formula_encoder,
+        cfg.formula_decoder,
+    )
+    match mode:
+        case ("rxn", False, False, False, False):
+            collator = collate_batch
+        case ("product", True, False, False, True):
+            collator = collate_batch_formula_only
+        case ("product", False, True, False, True):
+            collator = collate_batch_product_only_with_reactants_and_formula_multitask
+        case ("product", False, False, False, True):
+            collator = collate_batch_product_only_with_formula_multitask
+        case ("product", False, True, True, False):
+            collator = collate_batch_product_only_with_reactants_and_formula
+        case ("product", False, True, False, False):
+            collator = collate_batch_product_only_with_reactants
+        case ("product", False, False, True, False):
+            collator = collate_batch_product_only_with_formula
+        case ("product", False, False, False, False):
+            collator = collate_batch_product_only
+        case _:
+            raise ValueError(f"Unsupported collate configuration: {mode}")
+    return partial(collator, pad_id=pad_id)
 
 
 def build_model_components(cfg, device, vocab_size, pad_id, rxn_sep_id, formula_tokenizer=None):
-    if cfg.recursive_spectrum_encoder and cfg.encoder_mode == "raw":
-        recursive_network_cls = require_recursive_network()
-        trm_spec = recursive_network_cls(dimension=cfg.d_model, num_layers=2, num_heads=cfg.nhead, mlp_ratio=4.0, dropout=cfg.dropout)
-        encoder = RecursiveSpectrumEncoder(
-            seq_len=cfg.max_mz,
-            d_model=cfg.d_model,
-            network=trm_spec,
-            conv_hidden=cfg.conv_hidden,
-            conv_blocks=cfg.conv_blocks,
-            k_size=cfg.k_size,
-            dropout=cfg.dropout,
-            num_refinement_blocks=cfg.trm_ref_blocks,
-            num_latent_refinements=cfg.trm_latent_refines,
-            cnn=cfg.cnn,
-        ).to(device)
-    elif cfg.encoder_mode == "raw":
-        encoder = Encoder(seq_len=cfg.max_mz, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
-                          dim_feedforward=cfg.dim_ff, dropout=cfg.dropout, conv_hidden=cfg.conv_hidden, conv_blocks=cfg.conv_blocks, k_size=cfg.k_size, cnn=cfg.cnn).to(device)
-    elif cfg.encoder_mode == "binned":
-        encoder = BinnedEncoder(seq_len=cfg.max_bin_length, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
-                                dim_feedforward=cfg.dim_ff, dropout=cfg.dropout).to(device)
-    elif cfg.encoder_mode == "binned_2D":
-        encoder = PeakEncoder(seq_len=cfg.max_bin_length, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
-                              dim_feedforward=cfg.dim_ff, dropout=cfg.dropout).to(device)
-    else:
-        raise ValueError(f"Unsupported encoder mode: {cfg.encoder_mode}")
+    match cfg.encoder_mode, cfg.recursive_spectrum_encoder:
+        case "raw", True:
+            recursive_network_cls = require_recursive_network()
+            trm_spec = recursive_network_cls(dimension=cfg.d_model, num_layers=2, num_heads=cfg.nhead, mlp_ratio=4.0, dropout=cfg.dropout)
+            encoder = RecursiveSpectrumEncoder(
+                seq_len=cfg.max_mz,
+                d_model=cfg.d_model,
+                network=trm_spec,
+                conv_hidden=cfg.conv_hidden,
+                conv_blocks=cfg.conv_blocks,
+                k_size=cfg.k_size,
+                dropout=cfg.dropout,
+                num_refinement_blocks=cfg.trm_ref_blocks,
+                num_latent_refinements=cfg.trm_latent_refines,
+                cnn=cfg.cnn,
+            ).to(device)
+        case "raw", False:
+            encoder = Encoder(seq_len=cfg.max_mz, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
+                              dim_feedforward=cfg.dim_ff, dropout=cfg.dropout, conv_hidden=cfg.conv_hidden, conv_blocks=cfg.conv_blocks, k_size=cfg.k_size, cnn=cfg.cnn).to(device)
+        case "binned", False:
+            encoder = BinnedEncoder(seq_len=cfg.max_bin_length, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
+                                    dim_feedforward=cfg.dim_ff, dropout=cfg.dropout).to(device)
+        case "binned_2D", False:
+            encoder = PeakEncoder(seq_len=cfg.max_bin_length, d_model=cfg.d_model, nhead=cfg.nhead, num_layers=cfg.enc_layers,
+                                  dim_feedforward=cfg.dim_ff, dropout=cfg.dropout).to(device)
+        case mode, recursive:
+            raise ValueError(f"Unsupported encoder configuration: mode={mode}, recursive={recursive}")
 
     reactant_enc = None
     if cfg.reactant_encoder:

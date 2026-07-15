@@ -1,4 +1,6 @@
 import random
+from ast import literal_eval
+from math import isfinite
 from pathlib import Path
 from typing import Dict, List
 
@@ -16,22 +18,44 @@ from src.data.preprocess import (
 from src.data.tokenizers import SmilesTokenizerAdapter, FormulaTokenizerAdapter
 
 
+def parse_spectrum(value) -> Dict[int, float]:
+    parsed = literal_eval(value) if isinstance(value, str) else value
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Spectrum must be a dictionary, got {type(parsed).__name__}")
+
+    spectrum: Dict[int, float] = {}
+    for raw_mz, raw_intensity in parsed.items():
+        mz_value = float(raw_mz)
+        intensity = float(raw_intensity)
+        if not mz_value.is_integer() or not isfinite(intensity):
+            raise ValueError(f"Invalid spectrum peak: m/z={raw_mz!r}, intensity={raw_intensity!r}")
+        spectrum[int(mz_value)] = intensity
+    return spectrum
+
+
 def load_table(path: str | Path) -> pd.DataFrame:
     p = Path(path)
     if not p.exists():
         raise FileNotFoundError(f"File not found: {path}")
-    if p.suffix == '.csv':
-        return pd.read_csv(p)
-    raise ValueError(f"Unsupported file format: {p.suffix}")
+    match p.suffix.lower():
+        case ".csv":
+            return pd.read_csv(p)
+        case ".parquet" | ".pq":
+            return pd.read_parquet(p)
+        case suffix:
+            raise ValueError(f"Unsupported file format: {suffix}")
 
 
 def save_table(df: pd.DataFrame, path: str | Path) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    if p.suffix == '.csv':
-        df.to_csv(p, index=False)
-    else:
-        raise ValueError(f"Unsupported file format: {p.suffix}")
+    match p.suffix.lower():
+        case ".csv":
+            df.to_csv(p, index=False)
+        case ".parquet" | ".pq":
+            df.to_parquet(p, index=False)
+        case suffix:
+            raise ValueError(f"Unsupported file format: {suffix}")
 
 
 class SpecSmilesDataset(Dataset):
@@ -60,7 +84,8 @@ class SpecSmilesDataset(Dataset):
         enum_smiles: bool = False,
         frags: bool = False,
     ):
-        assert len(spectra) == len(smiles), "spectra and smiles must be same length"
+        if len(spectra) != len(smiles):
+            raise ValueError("spectra and smiles must be same length")
         self.spectra = spectra
         self.smiles = smiles
         self.tk = tokenizer
@@ -87,6 +112,8 @@ class SpecSmilesDataset(Dataset):
                 raise ValueError("return_formula=True is currently supported only with product_only=True.")
             if self.formulas is None:
                 raise ValueError("return_formula=True requires formulas to be provided (list[str]).")
+            if len(self.formulas) != len(self.spectra):
+                raise ValueError("formulas and spectra must be same length")
             if self.formula_tk is None:
                 raise ValueError("return_formula=True requires formula_tokenizer to be provided.")
 
@@ -100,7 +127,7 @@ class SpecSmilesDataset(Dataset):
         return len(self.spectra)
 
     def __getitem__(self, i: int):
-        smi = self._prepare_smiles(self.smiles[i])
+        smi = self._prepare_smiles(self.smiles[i], i)
         spec_vec = self._encode_spectrum(self.spectra[i])
 
         if not self.product_only:
@@ -109,26 +136,30 @@ class SpecSmilesDataset(Dataset):
 
         return self._product_only_item(spec_vec, smi, i)
 
-    def _prepare_smiles(self, smiles: str) -> str:
+    def _prepare_smiles(self, smiles: str, index: int) -> str:
         """Apply per-epoch/data-augmentation transforms to the stored SMILES value."""
         if self.frags:
-            smiles = random.choice(smiles.split('.'))
+            reactants, separator, product = smiles.partition(">>")
+            selected = random.choice(reactants.split("."))
+            smiles = selected + separator + product
         if self.enum_smiles:
             smiles = enumerate_reaction_smiles(smiles)
         if self.rand_reactants:
-            smiles = generate_one_combination(smiles, seed=self.epoch)
+            smiles = generate_one_combination(smiles, seed=(self.epoch << 32) ^ index)
         return smiles
 
     def _encode_spectrum(self, spec_dict: Dict[int, float]) -> torch.Tensor:
         vector = dict_to_vector_spectra(spec_dict, max_mz=self.max_mz, synthetic=self.synthetic_spectra)
-        if self.encoder_mode == 'raw':
-            return torch.from_numpy(vector)
-        if self.encoder_mode == 'binned':
-            binned_vector = get_ordered_bins(vector, max_mz=self.max_mz, max_bin_length=self.max_bin_length)
-            return torch.tensor(binned_vector, dtype=torch.float32)
-        if self.encoder_mode == 'binned_2D':
-            return dict_to_topk_peaks(spec_dict, max_mz=self.max_mz, max_bin_length=self.max_bin_length)
-        raise ValueError(f"Unknown encoder_mode: {self.encoder_mode}")
+        match self.encoder_mode:
+            case "raw":
+                return torch.from_numpy(vector)
+            case "binned":
+                binned_vector = get_ordered_bins(vector, max_mz=self.max_mz, max_bin_length=self.max_bin_length)
+                return torch.tensor(binned_vector, dtype=torch.float32)
+            case "binned_2D":
+                return dict_to_topk_peaks(spec_dict, max_mz=self.max_mz, max_bin_length=self.max_bin_length)
+            case mode:
+                raise ValueError(f"Unknown encoder_mode: {mode}")
 
     def _product_only_item(self, spec_vec: torch.Tensor, smiles: str, index: int):
         react_str, prod_str = self._split_reaction_smiles(smiles)

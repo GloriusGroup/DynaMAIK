@@ -41,14 +41,26 @@ def _save_tokenizer_payload(tokenizer, path: str | Path, tokenizer_type: str) ->
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
 
+
+def _truncate_ids(ids: List[int], max_len: int, eos_id: int, add_eos: bool) -> List[int]:
+    if max_len < 1:
+        raise ValueError("max_len must be at least 1")
+    if len(ids) <= max_len:
+        return ids
+
+    truncated = ids[:max_len]
+    if add_eos:
+        truncated[-1] = eos_id
+    return truncated
+
 SMI_REGEX = re.compile(r"""
     (
-      \[[^\]\@\\/]+\]                # bracket atoms, but exclude @ / \ inside
+      \[[^\]]+\]                       # bracket atoms, including stereochemistry
     | Br | Cl | Si                       # two-letter halogens (order matters)
     | C | N | O | S | P | F | I | B | H   # single-letter atoms
     | b | c | n | o | s | p          # aromatic atoms
     | \(| \)                         # branches
-    | \. | = | \# | -                # bonds/symbols
+    | \. | = | \# | - | / | \\      # bonds/symbols, including stereo bonds
     | \+                              # charge +
     | : | \* | \$                    # (optional non-stereo symbols)
     | >>                              # reaction separator ONLY
@@ -103,13 +115,15 @@ class SmilesTokenizerAdapter:
             ids = ids + [self.eos_id]
 
         rxn_id = self.stoi.get(">>")
-        if rxn_id is not None and rxn_id in ids:
+        if len(ids) > self.max_len and rxn_id is not None and rxn_id in ids:
             arrow_pos = ids.index(rxn_id)
-            if arrow_pos >= self.max_len:
+            last_content_pos = self.max_len - int(add_eos) - 1
+            if arrow_pos >= last_content_pos:
                 raise ValueError(
-                    f"'>>' would be truncated (len={len(ids)}, max_len={self.max_len}) for: {smiles[:120]} ...")
+                    f"Reaction prefix and at least one product token do not fit "
+                    f"(len={len(ids)}, max_len={self.max_len}) for: {smiles[:120]} ...")
 
-        return ids[: self.max_len]
+        return _truncate_ids(ids, self.max_len, self.eos_id, add_eos)
 
     def decode(self, ids: List[int], skip_specials: bool = True) -> str:
         toks: List[str] = []
@@ -209,7 +223,7 @@ class FormulaTokenizerAdapter:
         if add_eos:
             ids = ids + [self.eos_id]
 
-        return ids[: self.max_len]
+        return _truncate_ids(ids, self.max_len, self.eos_id, add_eos)
 
     def decode(self, ids: List[int], skip_specials: bool = True) -> str:
         toks: List[str] = []

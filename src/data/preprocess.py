@@ -25,7 +25,7 @@ def dict_to_vector_spectra(spec: dict[int, float], max_mz: int = 650, synthetic:
 
 def get_ordered_bins(intensity_vector: np.ndarray, max_mz: int, max_bin_length: int) -> list[int]:
     """Return non-zero m/z bins ordered by intensity and padded/truncated to a fixed length."""
-    peak_list = [(i + 1, intensity_vector[i]) for i in range(max_mz - 1)]
+    peak_list = [(i + 1, intensity_vector[i]) for i in range(min(max_mz, len(intensity_vector)))]
     peak_list.sort(key=lambda peak: peak[1], reverse=True)
 
     bin_list = [mz for mz, intensity in peak_list if intensity > 0]
@@ -36,7 +36,7 @@ def get_ordered_bins(intensity_vector: np.ndarray, max_mz: int, max_bin_length: 
 
 def dict_to_topk_peaks(spec: dict[int, float], max_mz: int, max_bin_length: int = 300) -> torch.Tensor:
     """Extract top-K positive peaks and return a fixed tensor of shape [K, 2]."""
-    items = [(float(mz), float(intensity)) for mz, intensity in spec.items() if 0 <= mz <= max_mz and intensity > 0]
+    items = [(float(mz), float(intensity)) for mz, intensity in spec.items() if 1 <= mz <= max_mz and intensity > 0]
     if not items:
         return torch.zeros(max_bin_length, 2, dtype=torch.float32)
 

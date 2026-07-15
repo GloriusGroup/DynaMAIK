@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+from functools import partial
 from pathlib import Path
 from typing import Any, Dict, Optional, List
 
@@ -11,7 +12,6 @@ import numpy as np
 from torch.amp import autocast
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from ast import literal_eval
 from collections import Counter
 from rdkit import Chem, RDLogger
 
@@ -19,15 +19,13 @@ from rdkit import Chem, RDLogger
 from src.models.configs import TrainConfig
 from src.data.tokenizers import SmilesTokenizerAdapter, FormulaTokenizerAdapter
 
-from src.data.loaders import SpecSmilesDataset
+from src.data.loaders import SpecSmilesDataset, parse_spectrum
 from src.data.collate import (
     collate_batch,
     collate_batch_product_only,
     collate_batch_product_only_with_reactants,
     collate_batch_product_only_with_formula,
     collate_batch_product_only_with_reactants_and_formula,
-    collate_batch_product_only_with_reactants_and_formula_multitask,
-    collate_batch_formula_only,
 )
 
 from src.models.spec2prod import (
@@ -35,6 +33,9 @@ from src.models.spec2prod import (
     ReactantEncoder, FormulaEncoder, FusionEncoder,
     RecursiveProductDecoder, RecursiveReactantEncoder, RecursiveSpectrumEncoder,
 )
+from src.utils.model_runtime import build_encoder_memory, repeat_memory
+from src.utils.train_runtime import validate_config
+from src.utils.utils_train import build_prefix_batch
 
 try:
     from src.models.tiny_recursive.core_network import TRMAttentionNetwork
@@ -73,14 +74,7 @@ def _get_attr(cfg: Any, key: str, default: Any) -> Any:
 
 
 def _repeat_memory(memory, num_repeats: int):
-    if num_repeats == 1:
-        return memory
-    if isinstance(memory, tuple):
-        return tuple(
-            None if x is None else x.repeat_interleave(num_repeats, dim=0)
-            for x in memory
-        )
-    return memory.repeat_interleave(num_repeats, dim=0)
+    return repeat_memory(memory, num_repeats)
 
 
 # -----------------------------
@@ -268,8 +262,8 @@ def build_models_from_cfg(
 # Memory construction (mirrors train.py)
 # -----------------------------
 def build_memory(
-    cfg: TrainConfig,
     encoder: torch.nn.Module,
+    decoder: torch.nn.Module,
     spec_batch: torch.Tensor,
     spectrum_enc: bool,
     reactant_enc: Optional[torch.nn.Module],
@@ -278,47 +272,17 @@ def build_memory(
     formula_enc: Optional[torch.nn.Module],
     formula_ids: Optional[torch.Tensor],
 ):
-    spec_memory, spec_mask = None, None
-    if spectrum_enc:
-        spec_memory = encoder(spec_batch)
-        if spec_memory is not None:
-            B, S, _ = spec_memory.shape
-            spec_mask = torch.zeros(B, S, dtype=torch.bool, device=spec_memory.device)
-
-    rxn_memory, rxn_mask = None, None
-    if reactant_enc is not None:
-        rxn_memory = reactant_enc(reactant_ids)
-        rxn_mask = (reactant_ids == reactant_enc.pad_id)
-
-    fml_memory, fml_mask = None, None
-    if formula_enc is not None:
-        fml_memory = formula_enc(formula_ids)
-        fml_mask = (formula_ids == formula_enc.pad_id)
-
-    if _get_attr(cfg, "multi_source_decoder", False):
-        if spec_memory is None or rxn_memory is None:
-            raise ValueError("multi_source_decoder=True requires both spectrum and reactant encoders.")
-        return (spec_memory, rxn_memory, spec_mask, rxn_mask)
-
-    mem_list = []
-    if fusion_enc is not None:
-        if spec_memory is None or rxn_memory is None:
-            raise ValueError("FusionEncoder requires spectrum_enc=True and reactant_enc!=None.")
-        fused_sr = fusion_enc(spec_memory, rxn_memory, mask_rxn=rxn_mask)
-        mem_list.append(fused_sr)
-        if fml_memory is not None:
-            mem_list.append(fml_memory)
-    else:
-        if spec_memory is not None:
-            mem_list.append(spec_memory)
-        if rxn_memory is not None:
-            mem_list.append(rxn_memory)
-        if fml_memory is not None:
-            mem_list.append(fml_memory)
-
-    if len(mem_list) == 0:
-        raise ValueError("No encoder memory available. Enable at least one of spectrum/reactant/formula.")
-    return mem_list[0] if len(mem_list) == 1 else torch.cat(mem_list, dim=1)
+    return build_encoder_memory(
+        encoder=encoder,
+        decoder=decoder,
+        spec_batch=spec_batch,
+        spectrum_enc=spectrum_enc,
+        reactant_enc=reactant_enc,
+        reactant_ids=reactant_ids,
+        fusion_enc=fusion_enc,
+        formula_enc=formula_enc,
+        formula_ids=formula_ids,
+    )
 
 
 # -----------------------------
@@ -334,11 +298,16 @@ def generate_smiles_samples(
     topk: int,
     num_samples: int,
     device: torch.device,
+    prefix_ids: torch.Tensor | None = None,
 ) -> List[List[str]]:
     B = memory[0].size(0) if isinstance(memory, tuple) else memory.size(0)
 
     memory_rep = _repeat_memory(memory, num_samples)
-    prefix = torch.full((B * num_samples, 1), tokenizer.bos_id, dtype=torch.long, device=device)
+    if prefix_ids is None:
+        prefix = torch.full((B, 1), tokenizer.bos_id, dtype=torch.long, device=device)
+    else:
+        prefix = prefix_ids.to(device)
+    prefix = prefix.repeat_interleave(num_samples, dim=0)
 
     gen_ids = decoder.generate_from_prefix(
         prefix_ids=prefix,
@@ -511,7 +480,7 @@ def main():
     ap.add_argument("--formula_col", type=str, default="sum_formula")
     ap.add_argument("--batch_size", type=int, default=64)
     ap.add_argument("--num_workers", type=int, default=2)
-    ap.add_argument("--device", type=str, default="cuda")
+    ap.add_argument("--device", type=str, default=None)
     ap.add_argument("--temperature", type=float, default=None)
     ap.add_argument("--topk", type=int, default=None)
     ap.add_argument("--num_samples", type=int, default=1, help="Number of full sampled predictions per input row.")
@@ -532,8 +501,14 @@ def main():
     cfg = TrainConfig()
     for k, v in cfg_dict.items():
         setattr(cfg, k, v)
+    validate_config(cfg)
 
-    device = torch.device(args.device if args.device else _get_attr(cfg, "device", "cuda"))
+    requested_device = args.device or _get_attr(cfg, "device", None)
+    if args.device is None and requested_device and str(requested_device).startswith("cuda") and not torch.cuda.is_available():
+        requested_device = "cpu"
+    device = torch.device(requested_device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    if device.type == "cuda" and not torch.cuda.is_available():
+        raise ValueError("CUDA was requested but is not available; use --device cpu")
     print(f"[INFO] device={device}")
 
     if args.artifact_dir is not None:
@@ -569,32 +544,35 @@ def main():
             _safe_load_state_dict(reactant_enc, payload["reactant_encoder"], "reactant_encoder")
         else:
             sd = _maybe_load_pt(artifact_dir / "predictions" / "reactant_encoder.pt")
-            if sd is not None:
-                _safe_load_state_dict(reactant_enc, sd, "reactant_encoder(from predictions/)")
+            if sd is None:
+                raise FileNotFoundError("Missing reactant encoder weights in checkpoint and predictions/")
+            _safe_load_state_dict(reactant_enc, sd, "reactant_encoder(from predictions/)")
 
     if fusion_enc is not None:
         if "fusion_encoder" in payload:
             _safe_load_state_dict(fusion_enc, payload["fusion_encoder"], "fusion_encoder")
         else:
             sd = _maybe_load_pt(artifact_dir / "predictions" / "fusion_encoder.pt")
-            if sd is not None:
-                _safe_load_state_dict(fusion_enc, sd, "fusion_encoder(from predictions/)")
+            if sd is None:
+                raise FileNotFoundError("Missing fusion encoder weights in checkpoint and predictions/")
+            _safe_load_state_dict(fusion_enc, sd, "fusion_encoder(from predictions/)")
 
     if formula_enc is not None:
         if "formula_encoder" in payload:
             _safe_load_state_dict(formula_enc, payload["formula_encoder"], "formula_encoder")
         else:
             sd = _maybe_load_pt(artifact_dir / "predictions" / "formula_encoder.pt")
-            if sd is not None:
-                _safe_load_state_dict(formula_enc, sd, "formula_encoder(from predictions/)")
+            if sd is None:
+                raise FileNotFoundError("Missing formula encoder weights in checkpoint and predictions/")
+            _safe_load_state_dict(formula_enc, sd, "formula_encoder(from predictions/)")
 
     if decoder_formula is not None:
-        sd = _maybe_load_pt(artifact_dir / "predictions" / "formula_decoder.pt")
+        sd = payload.get("formula_decoder")
         if sd is None:
-            print("[WARN] cfg.formula_decoder=True but predictions/formula_decoder.pt not found. Formula predictions disabled.")
-            decoder_formula = None
-        else:
-            _safe_load_state_dict(decoder_formula, sd, "formula_decoder")
+            sd = _maybe_load_pt(artifact_dir / "predictions" / "formula_decoder.pt")
+        if sd is None:
+            raise FileNotFoundError("Missing formula decoder weights in checkpoint and predictions/")
+        _safe_load_state_dict(decoder_formula, sd, "formula_decoder")
 
     encoder.eval()
     decoder.eval()
@@ -635,12 +613,12 @@ def main():
     spectra_raw = df[args.spectrum_col].tolist()
     spectra = []
     for s in tqdm(spectra_raw, desc="Parsing spectra"):
-        spectra.append(literal_eval(s) if isinstance(s, str) else s)
+        spectra.append(parse_spectrum(s))
 
     if args.reaction_smiles_col in df.columns:
         smiles_list = df[args.reaction_smiles_col].astype(str).tolist()
     else:
-        smiles_list = ["C>>C" if cfg.decoder_mode == "rxn" else "C"] * len(df)
+        smiles_list = ["C>>" if cfg.decoder_mode == "rxn" else "C"] * len(df)
 
     formulas_list = None
     if need_formula_enc:
@@ -672,17 +650,20 @@ def main():
 
     pad_id = smiles_tok.pad_id
 
-    if cfg.decoder_mode == "product":
-        if need_reactants and need_formula_enc:
-            collate_fn = lambda b: collate_batch_product_only_with_reactants_and_formula(b, pad_id)
-        elif need_reactants:
-            collate_fn = lambda b: collate_batch_product_only_with_reactants(b, pad_id)
-        elif need_formula_enc:
-            collate_fn = lambda b: collate_batch_product_only_with_formula(b, pad_id)
-        else:
-            collate_fn = lambda b: collate_batch_product_only(b, pad_id)
-    else:
-        collate_fn = lambda b: collate_batch(b, pad_id)
+    match cfg.decoder_mode, need_reactants, need_formula_enc:
+        case "product", True, True:
+            collator = collate_batch_product_only_with_reactants_and_formula
+        case "product", True, False:
+            collator = collate_batch_product_only_with_reactants
+        case "product", False, True:
+            collator = collate_batch_product_only_with_formula
+        case "product", False, False:
+            collator = collate_batch_product_only
+        case "rxn", False, False:
+            collator = collate_batch
+        case mode:
+            raise ValueError(f"Unsupported prediction batch configuration: {mode}")
+    collate_fn = partial(collator, pad_id=pad_id)
 
     loader = DataLoader(
         ds,
@@ -712,15 +693,9 @@ def main():
         for batch in tqdm(loader, desc="Predicting"):
             formula_strs = None
             formula_ids = None
+            generation_prefix = None
 
-            if need_reactants and _get_attr(cfg, "formula_decoder", False) and cfg.decoder_mode == "product" and len(batch) == 7:
-                spec_batch, reactant_ids, fml_in, fml_out, formula_strs, smi_in, smi_out = batch
-                formula_ids = None
-            elif _get_attr(cfg, "formula_decoder", False) and _get_attr(cfg, "train_formula_only", False) and (not need_reactants) and len(batch) == 4:
-                spec_batch, fml_in, fml_out, formula_strs = batch
-                reactant_ids = None
-                formula_ids = None
-            elif need_reactants and need_formula_enc:
+            if need_reactants and need_formula_enc:
                 spec_batch, reactant_ids, formula_ids, formula_strs, tgt_in, tgt_out = batch
             elif need_reactants:
                 spec_batch, reactant_ids, tgt_in, tgt_out = batch
@@ -733,6 +708,14 @@ def main():
                 reactant_ids = None
                 formula_ids = None
 
+            if cfg.decoder_mode == "rxn":
+                tgt_in = tgt_in.to(device, non_blocking=True)
+                generation_prefix, _, _ = build_prefix_batch(
+                    tgt_in_batch=tgt_in,
+                    rxn_sep_id=decoder.rxn_sep_id,
+                    pad_id=decoder.pad_id,
+                )
+
             spec_batch = spec_batch.to(device, non_blocking=True)
             if reactant_ids is not None:
                 reactant_ids = reactant_ids.to(device, non_blocking=True)
@@ -740,8 +723,8 @@ def main():
                 formula_ids = formula_ids.to(device, non_blocking=True)
 
             memory = build_memory(
-                cfg=cfg,
                 encoder=encoder,
+                decoder=decoder,
                 spec_batch=spec_batch,
                 spectrum_enc=spectrum_enc,
                 reactant_enc=reactant_enc,
@@ -765,6 +748,7 @@ def main():
                     topk=topk,
                     num_samples=num_samples,
                     device=device,
+                    prefix_ids=generation_prefix,
                 )
 
                 if cfg.decoder_mode == "rxn":

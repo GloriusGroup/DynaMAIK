@@ -127,7 +127,7 @@ def evaluate_formula_only(
         # ---- fixed-size count MAE (teacher-forced hidden states) ----
         if log_count_mae and (count_head is not None) and (elem_list is not None):
             pooled = pool_hidden_by_input_mask(hs_fml, fml_in, decoder_formula.pad_id)
-            pred_counts = count_head(pooled).float()
+            pred_counts = torch.nn.functional.softplus(count_head(pooled).float())
             true_counts = counts_from_formula_tokens(fml_out=fml_out, formula_tokenizer=formula_tokenizer, elements=elem_list, pad_id=decoder_formula.pad_id, eos_id=formula_eos_id).to(pred_counts.device)  # [B,n_elems]
             batch_sum = (pred_counts - true_counts).abs().sum(dim=0)
 
@@ -368,7 +368,7 @@ def evaluate_product_only_multitask(
         # ---- fixed-size count MAE (teacher-forced hidden states) ----
         if log_count_mae and (count_head is not None) and (elem_list is not None):
             pooled = pool_hidden_by_input_mask(hs_fml, fml_in, decoder_formula.pad_id)
-            pred_counts = count_head(pooled).float()
+            pred_counts = torch.nn.functional.softplus(count_head(pooled).float())
             true_counts = counts_from_formula_tokens(fml_out=fml_out, formula_tokenizer=formula_tokenizer, elements=elem_list, pad_id=decoder_formula.pad_id, eos_id=formula_eos_id).to(pred_counts.device)                                     # [B,n_elems]
             batch_sum = (pred_counts - true_counts).abs().sum(dim=0)
 

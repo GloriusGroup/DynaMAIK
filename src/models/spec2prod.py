@@ -163,6 +163,8 @@ class ReactantEncoder(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.token_embedding.weight[pad_id].zero_()
 
         self.pos_encoding = PositionalEncoding(max_len=max_len, d_model=d_model)
 
@@ -226,6 +228,8 @@ class FormulaEncoder(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.token_embedding.weight[pad_id].zero_()
 
         self.pos_encoding = PositionalEncoding(max_len=max_len, d_model=d_model)
 
@@ -272,6 +276,9 @@ def create_padding_mask(spec_vec: torch.Tensor, pad_value: float = 0.0) -> torch
 
     # True where it's padding
     mask = (spec_vec == pad_value)
+    fully_padded = mask.all(dim=1)
+    if fully_padded.any():
+        mask[fully_padded, 0] = False
 
     return mask  # bool tensor [N, T]
 
@@ -287,6 +294,9 @@ def create_2D_padding_mask(peaks: torch.Tensor) -> torch.Tensor:
     # real rows: any non-zero feature
     real = (peaks.abs().sum(dim=2) > 0)   # [B,K]
     mask = ~real                          # True = PAD
+    fully_padded = mask.all(dim=1)
+    if fully_padded.any():
+        mask[fully_padded, 0] = False
     return mask
 
 
@@ -484,6 +494,8 @@ class RecursiveReactantEncoder(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.token_embedding.weight[pad_id].zero_()
 
         self.pos = PositionalEncoding(max_len=max_len, d_model=d_model)
 
@@ -650,6 +662,8 @@ class Decoder(nn.Module):
 
         self.token_embedding = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         nn.init.normal_(self.token_embedding.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            self.token_embedding.weight[pad_id].zero_()
         self.positional = PositionalEncoding(max_len=max_len, d_model=d_model)
 
         if not multi_source:
@@ -685,9 +699,7 @@ class Decoder(nn.Module):
 
     @staticmethod
     def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
-        # float mask with -inf above diagonal; shape [T, T]
-        mask = torch.full((T, T), float("-inf"), device=device)
-        return torch.triu(mask, diagonal=1)
+        return torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
 
     def forward(
             self,
@@ -706,11 +718,16 @@ class Decoder(nn.Module):
 
         if not self.multi_source:
             # original single-source path
+            memory_padding_mask = None
+            if hasattr(memory, "values") and hasattr(memory, "padding_mask"):
+                memory_padding_mask = memory.padding_mask
+                memory = memory.values
             hs = self.decoder(
                 tgt=tgt,
                 memory=memory,
                 tgt_mask=tgt_mask,
                 tgt_key_padding_mask=tgt_key_padding_mask,
+                memory_key_padding_mask=memory_padding_mask,
             )                                                   # [B, T, d]
         else:
             spec_memory, rxn_memory, spec_mask, rxn_mask = memory
@@ -1068,9 +1085,7 @@ class RecursiveProductDecoder(nn.Module):
 
     @staticmethod
     def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
-        # float mask with -inf above diagonal; shape [T, T]
-        mask = torch.full((T, T), float("-inf"), device=device)
-        return torch.triu(mask, diagonal=1)
+        return torch.triu(torch.ones(T, T, dtype=torch.bool, device=device), diagonal=1)
 
     def forward(self, y_in_ids: torch.Tensor, memory: torch.Tensor) -> torch.Tensor:
         """
@@ -1081,10 +1096,18 @@ class RecursiveProductDecoder(nn.Module):
         B, T = y_in_ids.shape
         device = y_in_ids.device
 
-        # we ignore padding in memory for now → all True (valid)
+        padding_mask = None
+        if hasattr(memory, "values") and hasattr(memory, "padding_mask"):
+            padding_mask = memory.padding_mask
+            memory = memory.values
+
         Bm, S, _ = memory.shape
         assert B == Bm, "Batch size mismatch between y_in_ids and memory"
-        memory_mask = torch.ones(B, S, dtype=torch.bool, device=device)
+        memory_mask = (
+            torch.ones(B, S, dtype=torch.bool, device=device)
+            if padding_mask is None
+            else ~padding_mask
+        )
 
         # Let core handle embeddings & halting:
         # core.forward(tgt, memory, memory_mask) expects tgt ids

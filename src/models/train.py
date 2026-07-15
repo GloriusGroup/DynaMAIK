@@ -16,7 +16,6 @@ import mlflow.pytorch
 
 from tqdm import tqdm
 from pathlib import Path
-from ast import literal_eval
 from sklearn.model_selection import train_test_split
 from multiprocessing import Pool, cpu_count
 from urllib.parse import urlparse
@@ -26,7 +25,7 @@ from rdkit import RDLogger
 
 from src.data.tokenizers import SmilesTokenizerAdapter, FormulaTokenizerAdapter
 from src.models.spec2prod import Encoder, Decoder, ReactantEncoder, FormulaEncoder, FusionEncoder, ElementCountHead
-from src.data.loaders import SpecSmilesDataset
+from src.data.loaders import SpecSmilesDataset, parse_spectrum
 from src.utils.utils_train import log_autoregressive, make_worker_init_fn, log_autoregressive_product_only, canonicalize_smiles, build_prefix_batch, load_smarts_dict, compute_substructure_confidence_when_true_weighted, compile_smarts
 from src.models.configs import TrainConfig
 from src.models.metrics import SubstructureStats
@@ -42,13 +41,14 @@ from src.utils.train_runtime import (
     print_epoch_summary,
     select_collate_fn,
     unpack_training_batch,
+    validate_config,
 )
 from src.data.preprocess import get_sorted_reactants
 
 RDLogger.DisableLog('rdApp.*')
-# ---- enable fast TF32 matmuls (Ampere+ GPUs only) ----
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
+# ---- enable fast TF32 operations (Ampere+ GPUs only) ----
+torch.backends.cuda.matmul.fp32_precision = "tf32"
+torch.backends.cudnn.conv.fp32_precision = "tf32"
 
 
 
@@ -741,9 +741,17 @@ def train_loop(
             # checkpoints as before
             if val_metrics["val_loss"] < best_val:
                 best_val = val_metrics["val_loss"]
-                save_checkpoint(ckpt_dir / "best.pt", encoder, decoder, optimizer, epoch, cfg, reactant_enc=reactant_enc, fusion_enc=fusion_enc)
+                save_checkpoint(
+                    ckpt_dir / "best.pt", encoder, decoder, optimizer, epoch, cfg,
+                    reactant_enc=reactant_enc, fusion_enc=fusion_enc, formula_enc=formula_enc,
+                    formula_dec=formula_dec, count_head=count_head,
+                )
                 mlflow.log_metric("best_val_loss", float(best_val), step=epoch)
-            save_checkpoint(ckpt_dir / f"epoch_{epoch:03d}.pt", encoder, decoder, optimizer, epoch, cfg, reactant_enc=reactant_enc, fusion_enc=fusion_enc)
+            save_checkpoint(
+                ckpt_dir / f"epoch_{epoch:03d}.pt", encoder, decoder, optimizer, epoch, cfg,
+                reactant_enc=reactant_enc, fusion_enc=fusion_enc, formula_enc=formula_enc,
+                formula_dec=formula_dec, count_head=count_head,
+            )
 
         else:
             dt = time.time() - t0
@@ -793,6 +801,7 @@ def save_checkpoint(
 def main():
     tqdm.pandas()
     cfg = TrainConfig()
+    validate_config(cfg)
     device = torch.device(cfg.device)
     print(f"Using device: {device}")
 
@@ -840,7 +849,7 @@ def main():
             spectra = df[cfg.spectrum_column].tolist()
 
             with Pool(cpu_count()) as p:
-                spectra = list(tqdm(p.imap(literal_eval, spectra), total=len(spectra), desc="Parsing spectra"))
+                spectra = list(tqdm(p.imap(parse_spectrum, spectra), total=len(spectra), desc="Parsing spectra"))
 
             # smiles_train/val:  list of str
             smiles = df[cfg.reaction_smiles_column].tolist()
@@ -867,7 +876,7 @@ def main():
 
             spectra_train = df_train[cfg.spectrum_column].tolist()
             with Pool(cpu_count()) as p:
-                spectra_train = list(tqdm(p.imap(literal_eval, spectra_train), total=len(spectra_train), desc="Parsing train spectra"))
+                spectra_train = list(tqdm(p.imap(parse_spectrum, spectra_train), total=len(spectra_train), desc="Parsing train spectra"))
             smiles_train = df_train[cfg.reaction_smiles_column].tolist()
 
             need_formula = cfg.formula_encoder or cfg.formula_decoder
@@ -882,7 +891,7 @@ def main():
 
             spectra_val = df_val[cfg.spectrum_column].tolist()
             with Pool(cpu_count()) as p:
-                spectra_val = list(tqdm(p.imap(literal_eval, spectra_val), total=len(spectra_val), desc="Parsing val spectra"))
+                spectra_val = list(tqdm(p.imap(parse_spectrum, spectra_val), total=len(spectra_val), desc="Parsing val spectra"))
             smiles_val = df_val[cfg.reaction_smiles_column].tolist()
 
             if need_formula:
@@ -1022,7 +1031,7 @@ def main():
                 "weight_decay": cfg.weight_decay,
             })
 
-        optimizer = torch.optim.AdamW(param_groups, fused=True)
+        optimizer = torch.optim.AdamW(param_groups, fused=device.type == "cuda")
 
         mlflow.log_params({
             "optimizer": "AdamW", "warumup_epochs_enc": cfg.enc_warmup_epochs, "warumup_epochs_dec": cfg.dec_warmup_epochs, "use_count_head": cfg.use_count_head, "count_elements": ",".join(cfg.count_elements), "count_loss_weight": cfg.count_loss_weight,
@@ -1060,9 +1069,16 @@ def main():
             rxn_path = preds_dir / "formula_encoder.pt"
             torch.save(formula_enc.state_dict(), rxn_path)
 
+        if fusion_enc is not None:
+            fusion_path = preds_dir / "fusion_encoder.pt"
+            torch.save(fusion_enc.state_dict(), fusion_path)
+
         if cfg.formula_decoder:
             formula_dec_path = preds_dir / "formula_decoder.pt"
             torch.save(decoder_formula.state_dict(), formula_dec_path)
+        if count_head is not None:
+            count_head_path = preds_dir / "count_head.pt"
+            torch.save(count_head.state_dict(), count_head_path)
         print("Done.")
 
 
