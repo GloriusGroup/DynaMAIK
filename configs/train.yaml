@@ -1,0 +1,115 @@
+# Paths are resolved relative to this YAML file. Set validation_path to null
+# to create a deterministic 80/20 split from training_path.
+training_path: ../data/train.csv
+validation_path: ../data/validation.csv
+smarts_path: ../src/data/smarts_filtered.txt
+mlflow_tracking_uri: ../mlruns
+
+# Data
+max_mz: 650
+max_bin_length: 300
+max_smiles_len: 512
+formula_max_len: 32
+encoder_mode: raw
+decoder_mode: product
+sort_reactants: false
+enum_smiles: true
+frags: False
+spectrum_column: SPECTRUM_PREDICTED
+reaction_smiles_column: reaction_smiles
+formula_column: sum_formula
+randomize_reactants: false
+
+# Encoders
+reactant_encoder: true
+spectrum_encoder: true
+formula_encoder: false
+fusion_encoder: true
+recursive_spectrum_encoder: false
+recursive_reactant_encoder: false
+
+# Decoders and auxiliary objectives
+formula_decoder: true
+train_formula_only: false
+multi_source_decoder: false
+recursive_decoder: false
+confidence: true
+topk: false
+k_samples: 10
+formula_loss_weight: 1.5
+use_count_head: false
+count_loss_weight: 1.0
+count_elements:
+  - C
+  - H
+  - B
+  - Br
+  - Cl
+  - F
+  - I
+  - N
+  - O
+  - P
+  - S
+  - Si
+
+# Training
+batch_size: 100
+epochs: 50
+weight_decay: 0.01
+grad_clip: 1.0
+num_workers: 8
+eval_interval: 1
+device: auto
+print_every: 100
+experiment: default
+
+# Model
+d_model: 256
+nhead: 16
+enc_layers: 5
+dec_layers: 5
+dim_ff: 4096
+dropout: 0.05
+temperature: 1.0
+
+# Fusion encoder
+fusion_nhead: 4
+fusion_layers: 1
+fusion_dim_ff: 1024
+
+# Recursive models
+trm_ref_blocks: 3
+trm_latent_refines: 3
+trm_nhead: 8
+
+# Spectrum CNN
+cnn: true
+conv_hidden: 256
+conv_blocks: 3
+k_size: 7
+
+# Scheduler
+lr_scheduler: warmup_cosine
+warmup_epochs: 15
+cosine_cycles: 0.5
+scheduler_step_on: epoch
+plateau_patience: 5
+
+# Component learning rates
+lr_enc: 0.0005
+lr_enc_react: 0.0005
+lr_enc_formula: 0.0005
+lr_dec: 0.0005
+enc_warmup_epochs: 5
+enc_react_warmup_epochs: 5
+enc_formula_warmup_epochs: 5
+dec_warmup_epochs: 5
+enc_lr_start: 0.00000001
+enc_react_lr_start: 0.00000001
+enc_formula_lr_start: 0.00000001
+dec_lr_start: 0.00000001
+enc_lr_min: 0.000001
+enc_react_lr_min: 0.000001
+enc_formula_lr_min: 0.000001
+dec_lr_min: 0.000001
