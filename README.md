@@ -39,6 +39,8 @@ RDKit and PyTorch installation requirements can vary by platform. If installatio
 ## Project Structure
 
 ```text
+configs/
+  train.yaml            Complete training configuration template
 src/
   data/
     collate.py          Batch collation and teacher-forcing tensors
@@ -83,11 +85,16 @@ The formula column is required during training when either `formula_encoder` or 
 
 ## Configuration
 
-Training is configured through `TrainConfig` in `src/models/configs.py`. Update at least these path fields before starting a run:
+Training is configured with a YAML file. `configs/train.yaml` contains every active `TrainConfig` parameter and can be copied or edited for a run. `TrainConfig` in `src/models/configs.py` defines the schema and defaults; it does not contain dataset-specific absolute paths.
 
-- `home_path`: base directory used for data and MLflow artifacts.
-- `dataset`: training CSV or Parquet filename.
-- `validation_path`: optional validation CSV; use `None` for an automatic train/validation split.
+Configure these paths in YAML before starting training:
+
+- `training_path`: required training CSV or Parquet file.
+- `validation_path`: optional validation CSV or Parquet file; use `null` for an automatic 80/20 split.
+- `smarts_path`: SMARTS definitions used by confidence evaluation.
+- `mlflow_tracking_uri`: local MLflow directory or tracking-server URI.
+
+Relative filesystem paths are resolved against the directory containing the YAML file, not against the shell's current working directory. Unknown YAML keys produce an error so misspelled settings cannot silently fall back to defaults. Set `device: auto` to select CUDA when available and CPU otherwise.
 
 Important model options include:
 
@@ -117,10 +124,10 @@ Invalid combinations are rejected before data loading. In particular:
 
 ## Training
 
-After configuring `TrainConfig`, start training from the repository root:
+After editing the YAML paths and parameters, start training from the repository root:
 
 ```bash
-python -m src.models.train
+python -m src.models.train --config configs/train.yaml
 ```
 
 Training performs the following steps:
@@ -132,7 +139,7 @@ Training performs the following steps:
 5. Writes best and per-epoch checkpoints.
 6. Writes validation predictions and final component weights.
 
-The default configuration contains machine-specific dataset and MLflow paths. It will not be portable until `home_path`, `dataset`, and `validation_path` are updated for the local environment.
+The resolved configuration is stored in every checkpoint, making prediction independent of the original YAML file.
 
 ## Artifacts
 
@@ -140,6 +147,8 @@ Artifacts are written below the active MLflow artifact directory:
 
 ```text
 artifacts/
+  config/
+    train.yaml                    # original run configuration
   smiles_tokenizer.json
   formula_tokenizer.json          # when formula modeling is enabled
   checkpoints/
@@ -213,7 +222,5 @@ The tests cover tokenizer round trips and truncation, spectrum boundaries, fragm
 
 ## Current Limitations
 
-- Training paths are configured in Python rather than through a dedicated CLI or configuration file.
-- External validation data is currently loaded from CSV.
 - Recursive encoder and decoder options depend on modules not included in this repository.
 - Full model quality and throughput depend on the training dataset and hardware and are not covered by the unit tests.

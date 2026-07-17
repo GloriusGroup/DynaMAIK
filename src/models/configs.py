@@ -1,7 +1,8 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 
 import torch
+import yaml
 
 
 DEFAULT_SMARTS_PATH = str(Path(__file__).resolve().parents[1] / "data" / "smarts_filtered.txt")
@@ -22,6 +23,8 @@ class TransformerConfig:
 @dataclass
 class TrainConfig:
     # data
+    training_path: str = ""
+    validation_path: str | None = None  # None uses an automatic train/validation split
     max_mz: int = 650
     max_bin_length: int = 300
     max_smiles_len: int = 512
@@ -51,12 +54,11 @@ class TrainConfig:
     formula_loss_weight: float = 1.5  # weight for formula loss in multi-task training (if formula dominates, reduce)
     use_count_head: bool = False
     count_loss_weight: float = 1.0
-    count_elements: tuple[str] = ("C", "H", "B", "Br", "Cl", "F", "I", "N", "O", "P", "S", "Si")
+    count_elements: tuple[str, ...] = ("C", "H", "B", "Br", "Cl", "F", "I", "N", "O", "P", "S", "Si")
 
     # Paths
     smarts_path: str = DEFAULT_SMARTS_PATH
-    home_path: str = "/home/student/maik/projects/next_in_nrw"
-    validation_path: str | None = '/home/student/maik/projects/next_in_nrw/reaction_dev/data_science/cleaned/final_with_spectra/real_virtual_with_reagents_with_formula_test_2_frags_no_Hs.csv'  # if None, use 10% of training data as validation set
+    mlflow_tracking_uri: str = "mlruns"
 
     # training
     batch_size: int = 100
@@ -98,7 +100,6 @@ class TrainConfig:
     #device: str = 'cpu'
     #ckpt_dir: str = "checkpoints"
     print_every: int = 100
-    dataset: str = "real_virtual_with_reagents_with_formula_train_3_frags_no_Hs.csv"
     experiment: str = 'fragments'
     randomize_reactants: bool = False
     spectrum_column: str = "SPECTRUM_PREDICTED"
@@ -135,4 +136,44 @@ class TrainConfig:
     enc_formula_lr_min: float = 1e-6
     dec_lr_min: float = 1e-6
 
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "TrainConfig":
+        config_path = Path(path).expanduser().resolve()
+        if not config_path.is_file():
+            raise FileNotFoundError(f"Configuration file not found: {config_path}")
 
+        with config_path.open("r", encoding="utf-8") as stream:
+            values = yaml.safe_load(stream) or {}
+        if not isinstance(values, dict):
+            raise ValueError("Training configuration must be a YAML mapping")
+
+        known_fields = {field.name for field in fields(cls)}
+        unknown_fields = sorted(set(values) - known_fields)
+        if unknown_fields:
+            raise ValueError(f"Unknown training configuration fields: {', '.join(unknown_fields)}")
+
+        if "count_elements" in values:
+            values["count_elements"] = tuple(values["count_elements"])
+
+        base_dir = config_path.parent
+        for field_name in ("training_path", "validation_path", "smarts_path"):
+            value = values.get(field_name)
+            if value:
+                candidate = Path(value).expanduser()
+                if not candidate.is_absolute():
+                    candidate = base_dir / candidate
+                values[field_name] = str(candidate.resolve())
+
+        tracking_uri = values.get("mlflow_tracking_uri")
+        if tracking_uri and "://" not in tracking_uri and not tracking_uri.startswith("file:"):
+            candidate = Path(tracking_uri).expanduser()
+            if not candidate.is_absolute():
+                candidate = base_dir / candidate
+            values["mlflow_tracking_uri"] = str(candidate.resolve())
+
+        config = cls(**values)
+        if not config.training_path:
+            raise ValueError("training_path must be set in the YAML configuration")
+        if config.device == "auto":
+            config.device = "cuda" if torch.cuda.is_available() else "cpu"
+        return config

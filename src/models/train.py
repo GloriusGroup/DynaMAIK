@@ -1,5 +1,6 @@
 # src/train.py
 from __future__ import annotations
+import argparse
 import math
 import time
 import os
@@ -25,7 +26,7 @@ from rdkit import RDLogger
 
 from src.data.tokenizers import SmilesTokenizerAdapter, FormulaTokenizerAdapter
 from src.models.spec2prod import Encoder, Decoder, ReactantEncoder, FormulaEncoder, FusionEncoder, ElementCountHead
-from src.data.loaders import SpecSmilesDataset, parse_spectrum
+from src.data.loaders import SpecSmilesDataset, load_table, parse_spectrum
 from src.utils.utils_train import log_autoregressive, make_worker_init_fn, log_autoregressive_product_only, canonicalize_smiles, build_prefix_batch, load_smarts_dict, compute_substructure_confidence_when_true_weighted, compile_smarts
 from src.models.configs import TrainConfig
 from src.models.metrics import SubstructureStats
@@ -798,19 +799,50 @@ def save_checkpoint(
     #mlflow.log_artifact(str(path))
 
 
-def main():
+def _load_training_table(path: str, cfg: TrainConfig) -> pd.DataFrame:
+    columns = [cfg.spectrum_column, cfg.reaction_smiles_column]
+    if cfg.formula_encoder or cfg.formula_decoder:
+        columns.append(cfg.formula_column)
+
+    dataframe = load_table(path)
+    missing = [column for column in columns if column not in dataframe.columns]
+    if missing:
+        raise ValueError(f"Missing required columns in {path}: {', '.join(missing)}")
+    return dataframe.loc[:, columns].copy()
+
+
+def _validate_input_paths(cfg: TrainConfig) -> None:
+    paths = [("training_path", cfg.training_path)]
+    if cfg.validation_path:
+        paths.append(("validation_path", cfg.validation_path))
+    if cfg.confidence and not cfg.train_formula_only:
+        paths.append(("smarts_path", cfg.smarts_path))
+
+    missing = [f"{name}={path}" for name, path in paths if not Path(path).is_file()]
+    if missing:
+        raise FileNotFoundError("Missing configured input files: " + ", ".join(missing))
+
+
+def main(argv: list[str] | None = None):
+    parser = argparse.ArgumentParser(description="Train DynaMAIK from a YAML configuration.")
+    parser.add_argument("--config", required=True, help="Path to the training YAML file.")
+    args = parser.parse_args(argv)
+
     tqdm.pandas()
-    cfg = TrainConfig()
+    cfg = TrainConfig.from_yaml(args.config)
     validate_config(cfg)
+    _validate_input_paths(cfg)
     device = torch.device(cfg.device)
     print(f"Using device: {device}")
 
     # ---- MLflow setup ----
-    mlflow.set_tracking_uri(f'{cfg.home_path}/reaction_dev/src/models/mlruns')
+    mlflow.set_tracking_uri(cfg.mlflow_tracking_uri)
     mlflow.set_experiment(os.environ.get("MLFLOW_EXPERIMENT", f"{cfg.experiment}"))
-    run_name = f"cnnhidden{cfg.conv_hidden}_cnnblocks{cfg.conv_blocks}_kernelsize{cfg.k_size}_start_enc_{cfg.enc_lr_start}_start_dec_{cfg.dec_lr_start}_batchsize_{cfg.batch_size}_epochs{cfg.epochs}_d{cfg.d_model}_h{cfg.nhead}_enc{cfg.enc_layers}_dec{cfg.dec_layers}_{cfg.dataset}"
+    dataset_name = Path(cfg.training_path).name
+    run_name = f"cnnhidden{cfg.conv_hidden}_cnnblocks{cfg.conv_blocks}_kernelsize{cfg.k_size}_start_enc_{cfg.enc_lr_start}_start_dec_{cfg.dec_lr_start}_batchsize_{cfg.batch_size}_epochs{cfg.epochs}_d{cfg.d_model}_h{cfg.nhead}_enc{cfg.enc_layers}_dec{cfg.dec_layers}_{dataset_name}"
 
     with mlflow.start_run(run_name=run_name):
+        mlflow.log_artifact(str(Path(args.config).resolve()), artifact_path="config")
         artifact_uri = mlflow.get_artifact_uri()  # e.g. file:/.../mlruns/exp/run/artifacts
         artifact_path = Path(urlparse(artifact_uri).path)
         print("Artifact root:", artifact_path)
@@ -819,19 +851,8 @@ def main():
         tokenizer = SmilesTokenizerAdapter(max_len=cfg.max_smiles_len)
         pad_id, bos_id, eos_id = tokenizer.pad_id, tokenizer.bos_id, tokenizer.eos_id
 
-        # ---- Load your data here ----
         print("Loading data...")
-        if cfg.dataset.endswith('.csv'):
-            cols = [cfg.spectrum_column, cfg.reaction_smiles_column]
-            if cfg.formula_encoder or cfg.formula_decoder:
-                cols.append(cfg.formula_column)
-            df = pd.read_csv(f'{cfg.home_path}/reaction_dev/data_science/cleaned/final_with_spectra/{cfg.dataset}', usecols=cols)
-
-        elif cfg.dataset.endswith('.parquet'):
-            df = pd.read_parquet(f'{cfg.home_path}/reaction_dev/data_science/cleaned/final_with_spectra/{cfg.dataset}')
-
-        else:
-            raise ValueError(f"Unsupported dataset format: {cfg.dataset}")
+        df = _load_training_table(cfg.training_path, cfg)
 
         if cfg.experiment == 'test':
             df = df.head(100)
@@ -853,10 +874,6 @@ def main():
 
             # smiles_train/val:  list of str
             smiles = df[cfg.reaction_smiles_column].tolist()
-            if cfg.sort_reactants:
-                print("Sorting reactants in validation dataset...")
-                df[cfg.reaction_smiles_column] = df[cfg.reaction_smiles_column].progress_apply(get_sorted_reactants)
-
             need_formula = cfg.formula_encoder or cfg.formula_decoder
             if need_formula:
                 # assume df has a column cfg.formula_column like "PRODUCT_FORMULA"
@@ -870,10 +887,6 @@ def main():
         else:
             # Load training data
             df_train = df
-            if cfg.sort_reactants:
-                print("Sorting reactants in training dataset...")
-                df_train[cfg.reaction_smiles_column] = df_train[cfg.reaction_smiles_column].progress_apply(get_sorted_reactants)
-
             spectra_train = df_train[cfg.spectrum_column].tolist()
             with Pool(cpu_count()) as p:
                 spectra_train = list(tqdm(p.imap(parse_spectrum, spectra_train), total=len(spectra_train), desc="Parsing train spectra"))
@@ -884,7 +897,7 @@ def main():
                 formulas_train = df_train[cfg.formula_column].tolist()
 
             # Load validation data
-            df_val = pd.read_csv(f'{cfg.validation_path}')
+            df_val = _load_training_table(cfg.validation_path, cfg)
             if cfg.sort_reactants:
                 print("Sorting reactants in validation dataset...")
                 df_val[cfg.reaction_smiles_column] = df_val[cfg.reaction_smiles_column].progress_apply(get_sorted_reactants)
@@ -898,9 +911,6 @@ def main():
                 # assume df has a column cfg.formula_column like "PRODUCT_FORMULA"
                 formulas_val = df_val[cfg.formula_column].tolist()
 
-        # NOTE: For reaction training, make sure your dataset yields reaction strings
-        # like "R1.R2>>PRODUCT". This example still tokenizes `smiles_*` to keep your
-        # scaffolding; swap to reaction strings when available.
         print(f"Training samples: {len(smiles_train)}, Validation samples: {len(smiles_val)}")
         print("Fitting tokenizer...")
         for s in tqdm(smiles_train + smiles_val, desc="Tokenizer fit"):
